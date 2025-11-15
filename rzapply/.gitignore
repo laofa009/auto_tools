@@ -14,3 +14,6 @@ playwright/.auth/
 
 #zip files
 files
+dist
+dist.zip
+ms-playwright

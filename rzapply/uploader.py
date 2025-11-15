@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -10,6 +12,17 @@ from models import DEFAULT_OWNER_TYPE, OWNER_TYPE_ID_OPTIONS, Task
 AUTH_DIR = Path("playwright/.auth")
 STORAGE_STATE = AUTH_DIR / "storage_state.json"
 
+MS_PLAYWRIGHT = (
+    Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    / "playwright"
+    / "driver"
+    / "package"
+    / "ms-playwright"
+)
+if not MS_PLAYWRIGHT.exists():
+    MS_PLAYWRIGHT = Path.home() / "AppData/Local/ms-playwright"
+
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(MS_PLAYWRIGHT))
 
 def ensure_storage_state_file() -> bool:
     """Ensure the storage_state file exists, returning True if it already existed."""
