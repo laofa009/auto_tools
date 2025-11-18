@@ -296,6 +296,7 @@ class TaskUploader:
         page.wait_for_timeout(1000)  # 或者等待具体元素
         page.get_by_role("button", name="保存至草稿箱").wait_for(state="visible", timeout=20000)
         page.get_by_role("button", name="保存至草稿箱").click()
+        page.wait_for_timeout(8000)  # 或者等待具体元素
         self._log(log, "保存草稿箱完成")
 
     def _resolve_short_name(self, task: Task) -> str:
