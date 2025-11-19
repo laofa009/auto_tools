@@ -35,6 +35,10 @@ class Task:
 
     def __post_init__(self) -> None:
         self.config.setdefault("owners", [])
+        self.config.setdefault("login_username", "")
+        self.config.setdefault("login_password", "")
+        self.config.setdefault("login_type", "机构")
+        self.config.setdefault("submit_role", "代理人")
         self._normalize_owners()
         if self.status in (TaskStatus.PENDING, TaskStatus.CONFIGURED):
             self._sync_status()
@@ -76,7 +80,14 @@ class Task:
             )
         self.config["owners"] = normalized
 
+    def _needs_owner_config(self) -> bool:
+        login_type = str(self.config.get("login_type", "")).strip()
+        submit_role = str(self.config.get("submit_role", "")).strip()
+        return not (login_type == "个人用户" and submit_role == "申请人")
+
     def _owners_complete(self) -> bool:
+        if not self._needs_owner_config():
+            return True
         owners = self.config.get("owners", [])
         if not owners:
             return False

@@ -73,7 +73,13 @@ class TaskLoader:
 
     def _build_initial_config(self, meta: Dict) -> Dict[str, List[Dict[str, str]]]:
         _ = meta  # meta is currently unused but kept for potential future defaults
-        return {"owners": []}
+        return {
+            "owners": [],
+            "login_username": "",
+            "login_password": "",
+            "login_type": "机构",
+            "submit_role": "代理人",
+        }
 
     def _is_config_complete(self, config: Dict[str, List[Dict[str, str]]]) -> bool:
         owners = config.get("owners", [])

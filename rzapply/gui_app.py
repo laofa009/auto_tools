@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -58,6 +59,7 @@ class TaskDetailWidget(QWidget):
     config_saved = Signal(Task)
     upload_requested = Signal(Task)
     OWNER_TYPE_OPTIONS = list(OWNER_TYPE_ID_OPTIONS.keys())
+    SUBMIT_ROLES = ["代理人", "申请人"]
 
     def __init__(self):
         super().__init__()
@@ -69,13 +71,48 @@ class TaskDetailWidget(QWidget):
         self.status_label = QLabel("请选择任务")
         main_layout.addWidget(self.status_label)
 
+        account_widget = QWidget()
+        account_layout = QGridLayout(account_widget)
+        account_layout.setContentsMargins(0, 0, 0, 0)
+        account_layout.setHorizontalSpacing(12)
+        account_layout.setVerticalSpacing(8)
+
+        account_layout.addWidget(QLabel("登录类型"), 0, 0)
+        self.login_type_input = QComboBox()
+        self.login_type_input.addItems(["机构", "个人用户"])
+        self.login_type_input.setFixedWidth(140)
+        self.login_type_input.currentTextChanged.connect(self._handle_login_type_changed)
+        account_layout.addWidget(self.login_type_input, 0, 1)
+
+        account_layout.addWidget(QLabel("办理身份"), 0, 2)
+        self.submit_role_input = QComboBox()
+        self.submit_role_input.addItems(self.SUBMIT_ROLES)
+        self.submit_role_input.setFixedWidth(140)
+        self.submit_role_input.currentTextChanged.connect(self._handle_submit_role_changed)
+        account_layout.addWidget(self.submit_role_input, 0, 3)
+
+        account_layout.addWidget(QLabel("版权中心登录账号"), 0, 4)
+        self.login_username_input = QLineEdit()
+        self.login_username_input.setPlaceholderText("请输入账号")
+        self.login_username_input.setMinimumWidth(200)
+        account_layout.addWidget(self.login_username_input, 0, 5)
+
+        account_layout.addWidget(QLabel("版权中心登录密码"), 0, 6)
+        self.login_password_input = QLineEdit()
+        self.login_password_input.setPlaceholderText("请输入密码")
+        self.login_password_input.setEchoMode(QLineEdit.Password)
+        self.login_password_input.setMinimumWidth(200)
+        account_layout.addWidget(self.login_password_input, 0, 7)
+
+        account_layout.setColumnStretch(7, 1)
+        main_layout.addWidget(account_widget)
+
         owners_header = QHBoxLayout()
         owners_header.addWidget(QLabel("著作权人配置"))
         owners_header.addStretch()
         self.add_owner_button = QPushButton("新增著作权人")
         self.add_owner_button.clicked.connect(lambda: self._add_owner_row())
         owners_header.addWidget(self.add_owner_button)
-        main_layout.addLayout(owners_header)
 
         self.owner_scroll = QScrollArea()
         self.owner_scroll.setWidgetResizable(True)
@@ -83,7 +120,14 @@ class TaskDetailWidget(QWidget):
         self.owner_layout = QVBoxLayout(self.owner_container)
         self.owner_layout.setAlignment(Qt.AlignTop)
         self.owner_scroll.setWidget(self.owner_container)
-        main_layout.addWidget(self.owner_scroll, stretch=2)
+
+        self.owner_section = QWidget()
+        owner_section_layout = QVBoxLayout(self.owner_section)
+        owner_section_layout.setContentsMargins(0, 0, 0, 0)
+        owner_section_layout.setSpacing(6)
+        owner_section_layout.addLayout(owners_header)
+        owner_section_layout.addWidget(self.owner_scroll, stretch=1)
+        main_layout.addWidget(self.owner_section, stretch=2)
 
         button_row = QHBoxLayout()
         self.save_button = QPushButton("保存配置")
@@ -114,6 +158,8 @@ class TaskDetailWidget(QWidget):
             self._clear_owner_rows()
             self._add_owner_row()
             self._clear_meta_fields()
+            self._set_login_fields("机构", "", "")
+            self._set_submit_role("代理人")
             self._set_enabled(False)
             return
 
@@ -125,15 +171,22 @@ class TaskDetailWidget(QWidget):
         else:
             self._add_owner_row()
         self._populate_meta_fields(task)
+        login_type = str(task.config.get("login_type", "机构"))
+        username = str(task.config.get("login_username", ""))
+        password = str(task.config.get("login_password", ""))
+        self._set_login_fields(login_type, username, password)
+        self._set_submit_role(str(task.config.get("submit_role", "代理人")))
         self.status_label.setText(f"状态：{task.status.name}")
         self._set_enabled(True)
 
     def _set_enabled(self, enabled: bool) -> None:
         self.save_button.setEnabled(enabled)
         self.upload_button.setEnabled(enabled)
-        self.add_owner_button.setEnabled(enabled)
-        self.owner_container.setEnabled(enabled)
-        self._update_remove_buttons_state(enabled)
+        self.login_type_input.setEnabled(enabled)
+        self.login_username_input.setEnabled(enabled)
+        self.login_password_input.setEnabled(enabled)
+        self.submit_role_input.setEnabled(enabled)
+        self._apply_owner_section_state(enabled)
 
     def _update_remove_buttons_state(self, enabled: bool | None = None) -> None:
         if enabled is None:
@@ -146,18 +199,31 @@ class TaskDetailWidget(QWidget):
         if not self.current_task:
             return
         owners: list[dict[str, str]] = []
-        for row in self.owner_rows:
-            owners.append(
-                {
-                    "name": row["name"].text().strip(),
-                    "card_input": row["card_input"].text().strip(),
-                    "province": row["province"].text().strip(),
-                    "city": row["city"].text().strip(),
-                    "name_type": row["name_type"].currentText().strip(),
-                    "id_type": row["id_type"].currentText().strip(),
-                }
-            )
-        self.current_task.update_config({"owners": owners})
+        if not self._should_hide_owner_section():
+            for row in self.owner_rows:
+                owners.append(
+                    {
+                        "name": row["name"].text().strip(),
+                        "card_input": row["card_input"].text().strip(),
+                        "province": row["province"].text().strip(),
+                        "city": row["city"].text().strip(),
+                        "name_type": row["name_type"].currentText().strip(),
+                        "id_type": row["id_type"].currentText().strip(),
+                    }
+                )
+        login_type = self.login_type_input.currentText().strip()
+        submit_role = self.submit_role_input.currentText().strip()
+        login_username = self.login_username_input.text().strip()
+        login_password = self.login_password_input.text().strip()
+        self.current_task.update_config(
+            {
+                "owners": owners,
+                "login_type": login_type,
+                "submit_role": submit_role,
+                "login_username": login_username,
+                "login_password": login_password,
+            }
+        )
         self.status_label.setText(f"状态：{self.current_task.status.name}")
 
     def _handle_save(self) -> None:
@@ -203,6 +269,54 @@ class TaskDetailWidget(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self.meta_inputs.clear()
+
+    def _set_login_fields(self, login_type: str, username: str, password: str) -> None:
+        idx = self.login_type_input.findText(login_type) if login_type else -1
+        self.login_type_input.blockSignals(True)
+        if idx >= 0:
+            self.login_type_input.setCurrentIndex(idx)
+        else:
+            self.login_type_input.setCurrentIndex(0)
+        self.login_type_input.blockSignals(False)
+        self.login_username_input.setText(username)
+        self.login_password_input.setText(password)
+        self._apply_owner_section_state()
+
+    def _set_submit_role(self, role: str) -> None:
+        idx = self.submit_role_input.findText(role) if role else -1
+        self.submit_role_input.blockSignals(True)
+        if idx >= 0:
+            self.submit_role_input.setCurrentIndex(idx)
+        else:
+            self.submit_role_input.setCurrentIndex(0)
+        self.submit_role_input.blockSignals(False)
+        self._apply_owner_section_state()
+
+    def _should_hide_owner_section(self) -> bool:
+        return (
+            self.login_type_input.currentText().strip() == "个人用户"
+            and self.submit_role_input.currentText().strip() == "申请人"
+        )
+
+    def _apply_owner_section_state(self, base_enabled: bool | None = None) -> None:
+        if base_enabled is None:
+            base_enabled = self.save_button.isEnabled()
+        hide = self._should_hide_owner_section()
+        owner_enabled = base_enabled and not hide
+        self.owner_section.setVisible(not hide)
+        self.add_owner_button.setEnabled(owner_enabled)
+        self.owner_container.setEnabled(owner_enabled)
+        self._update_remove_buttons_state(owner_enabled)
+
+    def _handle_login_type_changed(self, value: str) -> None:
+        self._apply_owner_section_state(self.save_button.isEnabled())
+        if self.current_task:
+            self._sync_task_from_form()
+
+    def _handle_submit_role_changed(self, value: str) -> None:
+        self._apply_owner_section_state(self.save_button.isEnabled())
+        if self.current_task:
+            self._sync_task_from_form()
 
 
     def _add_owner_row(self, data: dict[str, str] | None = None) -> None:
@@ -426,8 +540,20 @@ class MainWindow(QMainWindow):
 
     def _handle_config_saved(self, task: Task) -> None:
         self._persist_state()
-        self._render_task_list()
-        self._reselect_task(task)
+        updated_row = None
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item and item.data(Qt.UserRole) is task:
+                item.setText(self._format_task_label(task))
+                updated_row = row
+                break
+        if updated_row is not None:
+            self.list_widget.blockSignals(True)
+            self.list_widget.setCurrentRow(updated_row)
+            self.list_widget.blockSignals(False)
+        else:
+            self._render_task_list()
+            self._reselect_task(task)
 
     def _start_upload(self, task: Task) -> None:
         if task.status == TaskStatus.UPLOADING:

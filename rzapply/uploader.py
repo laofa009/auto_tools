@@ -39,8 +39,21 @@ LogFn = Callable[[str], None] | None
 class TaskUploader:
     """Uploads a single task via Playwright automation."""
 
-    def __init__(self, headless: bool = False):
+    def __init__(
+        self,
+        headless: bool = False,
+        default_username: str | None = None,
+        default_password: str | None = None,
+        default_login_type: str | None = None,
+        default_submit_role: str | None = None,
+    ):
         self.headless = headless
+        self.default_username = default_username or os.environ.get("RZAPPLY_USERNAME", "Yf19942050676_")
+        self.default_password = default_password or os.environ.get("RZAPPLY_PASSWORD", "Yf19942050676_")
+        self.default_login_type = (default_login_type or os.environ.get("RZAPPLY_LOGIN_TYPE") or "机构").strip()
+        self.default_submit_role = (default_submit_role or os.environ.get("RZAPPLY_SUBMIT_ROLE") or "代理人").strip()
+        self.last_login_username: str | None = None
+        self.last_login_type: str | None = None
 
     def upload(self, task: Task, log: LogFn = None) -> None:
         self._log(log, f"开始上传：{task.display_name()}")
@@ -65,48 +78,106 @@ class TaskUploader:
         #     page.locator(".pic > a").first.click()
         # page1 = page1_info.value
         self._log(log, "进入办理页面")
-        page.get_by_role("cell", name="R11").get_by_role("button").click()
+        try:
+            button = page.get_by_role("cell", name="R11").get_by_role("button")
+            button.wait_for(state="visible", timeout=5000)
+            button.click()
+        except TimeoutError:
+            self._log(log, "未找到 R11 入口按钮，可能已经在办理页面")
 
-        if self._login_if_needed(page, log):
+        username, password, login_type, submit_role = self._get_login_context(task)
+        if self._login_if_needed(context, page, username, password, login_type, log):
             self._log(log, "登录成功，保存 storage_state")
             context.storage_state(path=str(STORAGE_STATE))
+            self.last_login_username = username
+            self.last_login_type = login_type
 
-        # page1.get_by_role("heading", name="我是代理人").click()
-        page.get_by_text("我是代理人 我为他人创作的软件申请著作权登记").click()
-        page.get_by_role("button", name="确定").click()
+        # 根据办理身份选择申报角色
+        if submit_role == "申请人":
+            page.get_by_text("我是申请人 我为自己创作的软件申请著作权登记").click()
+        else:
+            page.get_by_text("我是代理人 我为他人创作的软件申请著作权登记").click()
+            page.get_by_role("button", name="确定").click()
         self._log(log, "填写软件申请信息")
         self._fill_basic_form(page, task)
         self._log(log, "填写软件开发信息")
-        self._fill_soft_dev_info_form(page, task)
+        self._fill_soft_dev_info_form(page, task, login_type, submit_role)
         self._log(log, "填写软件功能与特点")
-        self._fill_soft_feature_form(page, task, log)
+        self._fill_soft_feature_form(page, task, login_type, submit_role, log)
         self._log(log, "页面操作完成，关闭浏览器")
         context.close()
         browser.close()
 
-    def _login_if_needed(self, page, log: LogFn) -> bool:
+    def _get_login_context(self, task: Task) -> tuple[str, str, str, str]:
+        username = (task.config.get("login_username") or "").strip()
+        password = (task.config.get("login_password") or "").strip()
+        login_type = (task.config.get("login_type") or "").strip() or self.default_login_type
+        submit_role = (task.config.get("submit_role") or "").strip() or self.default_submit_role
+        if not username:
+            username = self.default_username
+        if not password:
+            password = self.default_password
+        return username, password, login_type, submit_role
+
+    def _login_if_needed(self, context, page, username: str, password: str, login_type: str, log: LogFn) -> bool:
         """Return True if login occurred."""
         login_required = False
         username_input = page.get_by_role("textbox", name="请输入用户名/手机号/邮箱")
         try:
-            username_input.wait_for(state="visible", timeout=10000)
+            username_input.wait_for(state="visible", timeout=5000)
             login_required = True
         except TimeoutError:
             login_required = False
 
+        force_relogin = (
+            self.last_login_username is not None
+            and (self.last_login_username != username or (self.last_login_type or "") != login_type)
+        )
+
+        if not login_required and force_relogin:
+            self._log(log, "检测到账号或类型变更，强制清除会话重新登录")
+            context.clear_cookies()
+            page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+            page.goto("https://register.ccopyright.com.cn/registration.html#/index")
+            try:
+                page.get_by_text("跳过", exact=True).click(timeout=2000)
+            except Exception:
+                pass
+            try:
+                page.locator(".soft").click(timeout=5000)
+            except Exception:
+                pass
+            try:
+                entry = page.get_by_role("cell", name="R11").get_by_role("button")
+                entry.wait_for(state="visible", timeout=5000)
+                entry.click()
+            except TimeoutError:
+                self._log(log, "强制登录时未找到 R11 入口按钮，可能已经在办理页面")
+            username_input = page.get_by_role("textbox", name="请输入用户名/手机号/邮箱")
+            try:
+                username_input.wait_for(state="visible", timeout=5000)
+                login_required = True
+            except TimeoutError:
+                login_required = False
+
         if login_required:
             self._log(log, "检测到登录界面，执行登录流程")
-            page.get_by_text("机构", exact=True).click()
+            if not username or not password:
+                raise ValueError("未配置版权中心登录账号或密码")
+            tab_text = "机构" if login_type == "机构" else "个人用户"
+            page.get_by_text(tab_text, exact=True).click()
             username_input.click()
-            username_input.fill("Yf19942050676_")
+            username_input.fill(username)
             password_input = page.get_by_role("textbox", name="请输入密码")
             password_input.click()
-            password_input.fill("Yf19942050676_")
+            password_input.fill(password)
             page.get_by_role("button", name="立即登录").click()
-
-            button = page.get_by_role("cell", name="R11").get_by_role("button")
-            button.wait_for(state="visible", timeout=300000)
-            button.click()
+            try:
+                button = page.get_by_role("cell", name="R11").get_by_role("button")
+                button.wait_for(state="visible", timeout=5000)
+                button.click()
+            except TimeoutError:
+                self._log(log, "未找到 R11 入口按钮，可能已经在办理页面")
             return True
         self._log(log, "保持登录状态，无需重新登录")
         return False
@@ -123,7 +194,33 @@ class TaskUploader:
         page.get_by_role("textbox", name="请输入版本号").fill(task.meta.get("version", "V1.0"))
         page.get_by_role("button", name="下一步").click()
 
-    def _fill_soft_dev_info_form(self, page, task: Task) -> None:
+    def _fill_soft_dev_info_form(self, page, task: Task, login_type: str, submit_role: str) -> None:
+        if login_type == "个人用户" and submit_role == "申请人":
+            software_category = task.meta.get("software_category", "应用软件")
+            if software_category not in ["应用软件", "嵌入式软件", "中间件", "操作系统"]:
+                software_category = "应用软件"
+            page.locator(".box > .icon").first.click()
+            # 应用软件，嵌入式软件，中间件，操作系统
+            # 在这里等待下拉选项中的操作系统出来，再继续，
+            category_option = page.get_by_text(software_category, exact=True)
+            category_option.wait_for(state="visible", timeout=5000)
+            category_option.click()
+            page.get_by_text("原创").click()
+            page.get_by_text("单独开发", exact=True).click()
+            completion_date = task.meta.get("completion_date")  # 例如 "2024-06-15"
+            if completion_date:
+              try:
+                self._select_date_in_picker(page, completion_date)
+              except Exception as e:
+                # 如果日期控件结构变化，日志里能看到
+                self._log("选择完成日期失败：{completion_date}，错误：{e}")
+
+            page.get_by_text("未发表").click()
+            next_button = page.get_by_role("button", name="下一步")
+            next_button.wait_for(state="visible", timeout=20000)
+            next_button.click()
+            return
+
         software_category = task.meta.get("software_category", "应用软件")
         if software_category not in ["应用软件", "嵌入式软件", "中间件", "操作系统"]:
             software_category = "应用软件"
@@ -137,24 +234,11 @@ class TaskUploader:
         page.get_by_text("单独开发", exact=True).click()
         completion_date = task.meta.get("completion_date")
         if completion_date:
-            date_input = page.locator("div.datepicker-input > input")
-            date_input.wait_for(state="visible", timeout=5000)
-            date_input.evaluate("el => el.removeAttribute('readonly')")
-            date_input.evaluate("el => el.removeAttribute('disabled')")
-            date_input.click()
-            date_input.fill(completion_date)
-        # page.locator(".right > .icon > use").click()
-        # # 这个地方等待日期选择框中的今天显示出来再操作, page.get_by_role("link", name="今天")
-        # page.locator(".datePickerSelectText > .icon").first.click()
-        # today_link = page.get_by_role("link", name="今天")
-        # today_link.wait_for(state="visible", timeout=5000)
-        # page.get_by_text(f"{year}年").click()
-        # page.locator("div:nth-child(2) > .datePickerSelectText > .icon").click()
-        # page.get_by_text(f"{month}月", exact=True).click()
-        # page.get_by_text(f"{day}", exact=True).first.click()
-        # 在这个地方等待page.locator(".remove > .icon > use")这个元素出现再继续
-        remove_icon = page.locator(".remove > .icon > use")
-        remove_icon.wait_for(state="visible", timeout=5000)
+            try:
+                self._select_date_in_picker(page, completion_date)
+            except Exception as e:
+            # 如果日期控件结构变化，日志里能看到
+               self._log("选择完成日期失败：{completion_date}，错误：{e}")
         page.get_by_text("未发表").click()
         page.locator(".country_select > .hd-select > .box").click()
         page.locator(".country_select > .hd-select > .dropdown > .hd_scroll > .hd_scroll_content > div").first.click()
@@ -196,7 +280,39 @@ class TaskUploader:
             pass
         page.get_by_role("button", name="下一步").click()
 
-    def _fill_soft_feature_form(self, page, task: Task, log: LogFn) -> None:
+    
+    def _select_date_in_picker(self, page, date_str: str) -> None:
+        """
+        在“请选择日期”的日期控件中选择指定日期。
+        date_str 格式：YYYY-MM-DD
+        """
+        year, month, day = date_str.split("-")
+        month_int = int(month)
+        day_int = int(day)
+
+        # 1. 打开日期控件
+        date_box = page.get_by_role("textbox", name="请选择日期")
+        date_box.wait_for(state="visible", timeout=5000)
+        date_box.click()
+
+        # 有些组件会有淡入动画，保证面板已出现
+        page.get_by_text("年").first.wait_for(timeout=5000)
+
+        # 2. 选择年份
+        page.get_by_text("年").first.click()
+        page.get_by_text(f"{year}年", exact=True).click()
+
+        # 3. 选择月份
+        page.get_by_text("月").first.click()
+        page.get_by_text(f"{month_int}月", exact=True).click()
+
+        # 4. 选择日（用 role=cell 更稳）
+        page.get_by_role("cell", name=str(day_int)).click()
+
+        # 5. 让焦点离开，触发表单校验
+        page.keyboard.press("Tab")
+
+    def _fill_soft_feature_form(self, page, task: Task, login_type: str, submit_role: str, log: LogFn) -> None:
         #开发硬件环境
         self._log(log, "填写软件功能与特点")
         dev_hardware = task.meta.get("dev_hardware", "")
@@ -294,8 +410,14 @@ class TaskUploader:
         next_button.wait_for(state="visible", timeout=20000)
         next_button.click()
         page.wait_for_timeout(1000)  # 或者等待具体元素
-        page.get_by_role("button", name="保存至草稿箱").wait_for(state="visible", timeout=20000)
-        page.get_by_role("button", name="保存至草稿箱").click()
+        if login_type == "个人用户" and submit_role == "申请人":
+            submit_button = page.get_by_role("button", name="保存并提交申请")
+            submit_button.wait_for(state="visible", timeout=20000)
+            submit_button.click()
+        else:
+            save_button = page.get_by_role("button", name="保存至草稿箱")
+            save_button.wait_for(state="visible", timeout=20000)
+            save_button.click()
         page.wait_for_timeout(8000)  # 或者等待具体元素
         self._log(log, "保存草稿箱完成")
 
