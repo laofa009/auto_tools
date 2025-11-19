@@ -65,8 +65,10 @@ class TaskUploader:
     def _run(self, playwright: Playwright, task: Task, log: LogFn) -> None:
         self._log(log, "启动浏览器")
         launch_args = ["--start-fullscreen"]
-        browser = playwright.chromium.launch(headless=self.headless, args=launch_args)
-        context = browser.new_context(storage_state=str(STORAGE_STATE))
+        # browser = playwright.chromium.launch(headless=self.headless, args=launch_args)
+        # context = browser.new_context(storage_state=str(STORAGE_STATE))
+        browser = playwright.chromium.launch(headless=self.headless, args=["--start-maximized"])
+        context = browser.new_context(no_viewport=True)
         page = context.new_page()
         self._log(log, "打开官网")
         page.goto("https://register.ccopyright.com.cn/registration.html#/index")
@@ -195,7 +197,7 @@ class TaskUploader:
         page.get_by_role("button", name="下一步").click()
 
     def _fill_soft_dev_info_form(self, page, task: Task, login_type: str, submit_role: str) -> None:
-        if login_type == "个人用户" and submit_role == "申请人":
+        if submit_role == "申请人":
             software_category = task.meta.get("software_category", "应用软件")
             if software_category not in ["应用软件", "嵌入式软件", "中间件", "操作系统"]:
                 software_category = "应用软件"
@@ -410,7 +412,7 @@ class TaskUploader:
         next_button.wait_for(state="visible", timeout=20000)
         next_button.click()
         page.wait_for_timeout(1000)  # 或者等待具体元素
-        if login_type == "个人用户" and submit_role == "申请人":
+        if submit_role == "申请人":
             submit_button = page.get_by_role("button", name="保存并提交申请")
             submit_button.wait_for(state="visible", timeout=20000)
             submit_button.click()

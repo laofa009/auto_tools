@@ -15,7 +15,7 @@ class TaskStatus(Enum):
 
 
 OWNER_REQUIRED_FIELDS: List[str] = ["name", "province","city","card_input"]
-DEFAULT_OWNER_TYPE = "自然人"
+DEFAULT_OWNER_TYPE = "企业法人"
 OWNER_TYPE_ID_OPTIONS: Dict[str, List[str]] = {
     "自然人": ["居民身份证", "军人身份证明（军官证、士兵证等）", "户口本", "其他有效证件"],
     "企业法人": ["统一社会信用代码证书"],
@@ -81,9 +81,8 @@ class Task:
         self.config["owners"] = normalized
 
     def _needs_owner_config(self) -> bool:
-        login_type = str(self.config.get("login_type", "")).strip()
         submit_role = str(self.config.get("submit_role", "")).strip()
-        return not (login_type == "个人用户" and submit_role == "申请人")
+        return submit_role != "申请人"
 
     def _owners_complete(self) -> bool:
         if not self._needs_owner_config():

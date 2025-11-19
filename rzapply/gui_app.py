@@ -293,10 +293,7 @@ class TaskDetailWidget(QWidget):
         self._apply_owner_section_state()
 
     def _should_hide_owner_section(self) -> bool:
-        return (
-            self.login_type_input.currentText().strip() == "个人用户"
-            and self.submit_role_input.currentText().strip() == "申请人"
-        )
+        return self.submit_role_input.currentText().strip() == "申请人"
 
     def _apply_owner_section_state(self, base_enabled: bool | None = None) -> None:
         if base_enabled is None:
