@@ -1,6 +1,10 @@
 from __future__ import annotations
-
+import re
+from pathlib import Path
+from playwright.sync_api import Page
+from PIL import Image   # 需要: pip install pillow
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Callable, Sequence
@@ -407,21 +411,109 @@ class TaskUploader:
             "div:nth-child(2) > .upLoadBox > .hdUpload > .hdUpload-imgBtn > .hdUpload-item-ball > .icon"
         ).first
         self._upload_material(page, doc_locator, document_material)
-        page.wait_for_timeout(10000)  # 或者等待具体元素
+        page.wait_for_timeout(8000)  # 或者等待具体元素
         next_button = page.get_by_role("button", name="下一步")
-        next_button.wait_for(state="visible", timeout=20000)
+        next_button.wait_for(state="visible", timeout=8000)
         next_button.click()
         page.wait_for_timeout(1000)  # 或者等待具体元素
         if submit_role == "申请人":
             submit_button = page.get_by_role("button", name="保存并提交申请")
-            submit_button.wait_for(state="visible", timeout=20000)
+            submit_button.wait_for(state="visible", timeout=6000)
             submit_button.click()
+            self._log(log, "保存并提交申请完成")
         else:
             save_button = page.get_by_role("button", name="保存至草稿箱")
-            save_button.wait_for(state="visible", timeout=20000)
+            save_button.wait_for(state="visible", timeout=6000)
             save_button.click()
-        page.wait_for_timeout(8000)  # 或者等待具体元素
-        self._log(log, "保存草稿箱完成")
+            self._log(log, "保存草稿箱完成")
+        page.wait_for_timeout(5000)  # 或者等待具体元素
+
+        # 只有申请人模式才需要打印签章页，代理人保存草稿可以直接结束
+        if submit_role == "申请人":
+            try:
+                self._generate_sign_page_pdf(page, task, log)
+            except Exception as e:
+                self._log(log, f"生成签章页 PDF 失败：{e}")
+
+    def _generate_sign_page_pdf(self, page: Page, task: Task, log: LogFn) -> Path:
+        """
+        从当前任务详情页：
+        1）点击【打印签章页】打开材料列表页（新窗口）；
+        2）在列表页点击底部【打印】，如果出现新窗口则使用新窗口，否则使用当前窗口；
+        3）对签章页预览执行 page.pdf，生成签章页 PDF。
+        """
+        context = page.context
+
+        self._log(log, "点击【打印签章页】，打开签章材料列表")
+
+        # 1. 打开“打印签章页”列表窗口（确实是 popup）
+        with page.expect_popup() as list_popup:
+            page.get_by_role("button", name="打印签章页").click()
+        sign_list_page = list_popup.value
+        sign_list_page.wait_for_load_state("networkidle")
+        self._log(log, f"签章材料列表页已打开，URL = {sign_list_page.url}")
+
+        # 2. 在列表页点击底部【打印】
+        self._log(log, "在签章材料列表页点击【打印】")
+
+        # 点击前先记一下已有页面数量
+        pages_before = context.pages.copy()
+
+        # 这里不能再 expect_navigation，会卡死
+        sign_list_page.get_by_role("button", name="打印").click()
+
+        # 等一小会，看是否出现新窗口 / 新标签页
+        sign_list_page.wait_for_timeout(3000)
+        pages_after = context.pages.copy()
+
+        sign_page: Page
+        if len(pages_after) > len(pages_before):
+            # 出现了新窗口，用最后一个
+            sign_page = pages_after[-1]
+            self._log(log, f"检测到签章页以新窗口形式打开，URL = {sign_page.url}")
+        else:
+            # 没有新窗口，说明是在当前页里直接变成预览
+            sign_page = sign_list_page
+            self._log(log, f"签章页在当前列表页面中渲染，当前 URL = {sign_page.url}")
+
+        # 尽量等资源加载完
+        try:
+            sign_page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception as e:
+            self._log(log, f"等待签章页网络空闲超时，继续尝试导出 PDF：{e}")
+
+        # 输出目录 & 文件名
+        output_root = self._locate_material_root(task) or task.extract_dir
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        safe_name = "".join(
+            ch if ch not in r'\/:*?"<>|' else "_"
+            for ch in task.meta.get("software_name", "软件著作权")
+        )
+        pdf_path = output_root / f"{safe_name}_签章页.pdf"
+
+        # 5. 生成 PDF（Chromium + headless=True 时效果最好）
+        self._log(log, f"开始生成签章页 PDF：{pdf_path}")
+        try:
+            sign_page.pdf(
+                path=str(pdf_path),
+                format="A4",
+                print_background=True,
+            )
+            self._log(log, "签章页 PDF 生成完成")
+        except Exception as e:
+            self._log(log, f"调用 page.pdf 失败：{e}")
+            raise
+
+        # 6. 收尾：关掉签章页窗口和列表页窗口（如果不是同一个）
+        try:
+            if sign_page is not sign_list_page:
+                sign_page.close()
+            sign_list_page.close()
+        except Exception:
+            pass
+
+        return pdf_path
 
     def _resolve_short_name(self, task: Task) -> str:
         # meta_value = task.meta.get("软件简称") or task.meta.get("软件全称")

@@ -11,22 +11,22 @@
    uv pip install -r pyproject.toml
    playwright install chromium  # 首次运行 Playwright 需要安装浏览器
    ```
-
 3. 运行 GUI：
 
    ```bash
    python main.py
    ```
 
-
 4.windows环境运行步骤
-  cd .\rzapply\
+  cd .\rzapply
   python -m venv .venv
   .\.venv\Scripts\Activate.ps1
   pip install "playwright>=1.55.0" "pyside6>=6.7.0"
   python -m playwright install chromium
   pip install pyinstaller
   python main.py
+
+playwright codegen https://register.ccopyright.com.cn/registration.html#/index
 
 启动后先点击“选择 ZIP 目录”并指向存放压缩包的文件夹，然后再点击“重新扫描 ZIP”即可生成任务列表。右侧表单包含必填字段（软件全称、版本号、软件分类、开发完成日期、首次发表日期），可以覆盖 `meta.json` 中的值。点击“保存配置”会把当前状态写入所选目录下的 `data.json`，方便下次启动继续。
 
@@ -44,7 +44,6 @@ pyinstaller --name rzapply --onefile --windowed main.py
 ```
 
 如需携带资源或 Playwright 数据，可通过 `.spec` 文件或 `--add-data` 参数一起打包。
-
 
 下面是一套从零开始到重新打包可运行 rzapply.exe 的完整流程，确保 Playwright 浏览器一并打包进去，最终 exe 开箱即用。
 
@@ -99,5 +98,3 @@ ms-playwright 目录是否完整、包含 chromium-xxxx\chrome-win\chrome.exe。
 rzapply.spec 的 --add-data 路径书写是否正确（Windows 路径用 ; 分隔目标目录）。
 PLAYWRIGHT_BROWSERS_PATH 环境变量是否被正确设置到随包目录。
 按上述步骤重新打包即可。如果需要我帮忙修改 uploader.py 或 rzapply.spec，告诉我当前代码内容即可。
-
-
