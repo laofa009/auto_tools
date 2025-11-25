@@ -4,6 +4,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QTextCursor
@@ -65,7 +66,7 @@ class TaskDetailWidget(QWidget):
         super().__init__()
         self.current_task: Task | None = None
         self.owner_rows: list[dict[str, QWidget]] = []
-        self.meta_inputs: dict[str, QWidget] = {}
+        self.meta_inputs: dict[str, dict[str, Any]] = {}
 
         main_layout = QVBoxLayout(self)
         self.status_label = QLabel("请选择任务")
@@ -195,9 +196,9 @@ class TaskDetailWidget(QWidget):
         for row in self.owner_rows:
             row["remove_button"].setEnabled(allow_remove)
 
-    def _sync_task_from_form(self) -> None:
+    def _sync_task_from_form(self) -> bool:
         if not self.current_task:
-            return
+            return True
         owners: list[dict[str, str]] = []
         if not self._should_hide_owner_section():
             for row in self.owner_rows:
@@ -224,19 +225,46 @@ class TaskDetailWidget(QWidget):
                 "login_password": login_password,
             }
         )
+
+        meta_updates: dict[str, Any] = {}
+        for key, payload in self.meta_inputs.items():
+            widget = payload.get("widget")
+            if isinstance(widget, QLineEdit):
+                meta_updates[key] = widget.text().strip()
+                continue
+            if isinstance(widget, QPlainTextEdit):
+                text_value = widget.toPlainText().strip()
+                if payload.get("is_json"):
+                    if not text_value:
+                        origin = payload.get("original_type")
+                        meta_updates[key] = [] if origin is list else {}
+                        continue
+                    try:
+                        meta_updates[key] = json.loads(text_value)
+                    except json.JSONDecodeError as exc:
+                        QMessageBox.warning(self, "JSON 格式错误", f"{key} 字段解析失败：{exc}")
+                        return False
+                else:
+                    meta_updates[key] = text_value
+        if meta_updates:
+            self.current_task.meta.update(meta_updates)
+
         self.status_label.setText(f"状态：{self.current_task.status.name}")
+        return True
 
     def _handle_save(self) -> None:
         if not self.current_task:
             return
-        self._sync_task_from_form()
+        if not self._sync_task_from_form():
+            return
         self.config_saved.emit(self.current_task)
 
     def _handle_upload(self) -> None:
         print("===== _handle_upload=====")
         if not self.current_task:
             return
-        self._sync_task_from_form()
+        if not self._sync_task_from_form():
+            return
         print("===== emit task=====")
         self.upload_requested.emit(self.current_task)
 
@@ -245,22 +273,25 @@ class TaskDetailWidget(QWidget):
         self.meta_inputs = {}
         for key, value in task.meta.items():
             widget: QWidget
-            if isinstance(value, (dict, list)):
+            is_json_value = isinstance(value, (dict, list))
+            if is_json_value:
                 editor = QPlainTextEdit(json.dumps(value, ensure_ascii=False, indent=2))
-                editor.setFixedHeight(80)
-                editor.setReadOnly(True)
                 editor.setMinimumWidth(600)
+                editor.setMinimumHeight(80)
                 editor.moveCursor(QTextCursor.Start)
                 editor.verticalScrollBar().setValue(editor.verticalScrollBar().minimum())
                 widget = editor
             else:
                 editor = QLineEdit(str(value))
-                editor.setReadOnly(True)
                 editor.setMinimumWidth(600)
                 editor.setCursorPosition(0)
                 widget = editor
             self.meta_form.addRow(key, widget)
-            self.meta_inputs[key] = widget
+            self.meta_inputs[key] = {
+                "widget": widget,
+                "is_json": is_json_value,
+                "original_type": type(value),
+            }
 
     def _clear_meta_fields(self) -> None:
         while self.meta_form.count():

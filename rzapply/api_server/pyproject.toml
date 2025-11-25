@@ -1,0 +1,20 @@
+[project]
+name = "rzapply-api"
+version = "0.1.0"
+description = "FastAPI wrapper around the rzapply automation core"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+cli = ["uvicorn[standard]"]
+
+[project.scripts]
+rzapply-api = "api_server.app:app"

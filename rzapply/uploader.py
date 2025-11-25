@@ -411,7 +411,7 @@ class TaskUploader:
             "div:nth-child(2) > .upLoadBox > .hdUpload > .hdUpload-imgBtn > .hdUpload-item-ball > .icon"
         ).first
         self._upload_material(page, doc_locator, document_material)
-        page.wait_for_timeout(8000)  # 或者等待具体元素
+        page.wait_for_timeout(20000)  # 或者等待具体元素
         next_button = page.get_by_role("button", name="下一步")
         next_button.wait_for(state="visible", timeout=8000)
         next_button.click()
