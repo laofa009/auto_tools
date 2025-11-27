@@ -11,9 +11,14 @@ wheels/
 
 # Playwright auth artifacts
 playwright/.auth/
+rzapply/api_server/playwright/.auth/
+
 
 #zip files
 files
 dist
 dist.zip
 ms-playwright
+image
+api_runtime
+tasks_output

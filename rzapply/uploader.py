@@ -1,7 +1,7 @@
 from __future__ import annotations
 import re
 from pathlib import Path
-from playwright.sync_api import Page
+from playwright.sync_api import Locator, Page
 from PIL import Image   # 需要: pip install pillow
 import os
 import re
@@ -27,6 +27,12 @@ if not MS_PLAYWRIGHT.exists():
     MS_PLAYWRIGHT = Path.home() / "AppData/Local/ms-playwright"
 
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(MS_PLAYWRIGHT))
+
+DEFAULT_CERT_CONTACT_NAME = "朱砂"
+DEFAULT_CERT_CONTACT_UNIT = "中国江苏徐州邳州市东湖街道汉府西侧环球新天地二栋"
+DEFAULT_CERT_DETAIL_ADDRESS = DEFAULT_CERT_CONTACT_UNIT
+DEFAULT_CERT_POSTAL_CODE = "221300"
+DEFAULT_CERT_PHONE = "18168245213"
 
 def ensure_storage_state_file() -> bool:
     """Ensure the storage_state file exists, returning True if it already existed."""
@@ -59,14 +65,15 @@ class TaskUploader:
         self.last_login_username: str | None = None
         self.last_login_type: str | None = None
 
-    def upload(self, task: Task, log: LogFn = None) -> None:
+    def upload(self, task: Task, log: LogFn = None) -> dict[str, Path | None]:
         self._log(log, f"开始上传：{task.display_name()}")
         ensure_storage_state_file()
         with sync_playwright() as playwright:
-            self._run(playwright, task, log)
+            artifacts = self._run(playwright, task, log)
         self._log(log, "上传流程结束")
+        return artifacts
 
-    def _run(self, playwright: Playwright, task: Task, log: LogFn) -> None:
+    def _run(self, playwright: Playwright, task: Task, log: LogFn) -> dict[str, Path | None]:
         self._log(log, "启动浏览器")
         launch_args = ["--start-fullscreen"]
         # browser = playwright.chromium.launch(headless=self.headless, args=launch_args)
@@ -109,10 +116,11 @@ class TaskUploader:
         self._log(log, "填写软件开发信息")
         self._fill_soft_dev_info_form(page, task, login_type, submit_role)
         self._log(log, "填写软件功能与特点")
-        self._fill_soft_feature_form(page, task, login_type, submit_role, log)
+        sign_pdf_path = self._fill_soft_feature_form(page, task, login_type, submit_role, log)
         self._log(log, "页面操作完成，关闭浏览器")
         context.close()
         browser.close()
+        return {"sign_page_pdf": sign_pdf_path}
 
     def _get_login_context(self, task: Task) -> tuple[str, str, str, str]:
         username = (task.config.get("login_username") or "").strip()
@@ -318,7 +326,14 @@ class TaskUploader:
         # 5. 让焦点离开，触发表单校验
         page.keyboard.press("Tab")
 
-    def _fill_soft_feature_form(self, page, task: Task, login_type: str, submit_role: str, log: LogFn) -> None:
+    def _fill_soft_feature_form(
+        self,
+        page,
+        task: Task,
+        login_type: str,
+        submit_role: str,
+        log: LogFn,
+    ) -> Path | None:
         #开发硬件环境
         self._log(log, "填写软件功能与特点")
         dev_hardware = task.meta.get("dev_hardware", "")
@@ -411,11 +426,12 @@ class TaskUploader:
             "div:nth-child(2) > .upLoadBox > .hdUpload > .hdUpload-imgBtn > .hdUpload-item-ball > .icon"
         ).first
         self._upload_material(page, doc_locator, document_material)
-        page.wait_for_timeout(20000)  # 或者等待具体元素
+        page.wait_for_timeout(10000)  # 或者等待具体元素
         next_button = page.get_by_role("button", name="下一步")
         next_button.wait_for(state="visible", timeout=8000)
         next_button.click()
-        page.wait_for_timeout(1000)  # 或者等待具体元素
+        page.wait_for_timeout(5000)  # 或者等待具体元素
+        self._ensure_certificate_receive_address_selected(page, log)
         if submit_role == "申请人":
             submit_button = page.get_by_role("button", name="保存并提交申请")
             submit_button.wait_for(state="visible", timeout=6000)
@@ -429,11 +445,13 @@ class TaskUploader:
         page.wait_for_timeout(5000)  # 或者等待具体元素
 
         # 只有申请人模式才需要打印签章页，代理人保存草稿可以直接结束
+        sign_pdf_path: Path | None = None
         if submit_role == "申请人":
             try:
-                self._generate_sign_page_pdf(page, task, log)
+                sign_pdf_path = self._generate_sign_page_pdf(page, task, log)
             except Exception as e:
                 self._log(log, f"生成签章页 PDF 失败：{e}")
+        return sign_pdf_path
 
     def _generate_sign_page_pdf(self, page: Page, task: Task, log: LogFn) -> Path:
         """
@@ -569,3 +587,91 @@ class TaskUploader:
     def _log(self, log: LogFn, message: str) -> None:
         if log:
             log(message)
+
+    def _ensure_certificate_receive_address_selected(self, page: Page, log: LogFn) -> None:
+        """
+        证书领取地址列表有时不会自动选中默认联系人，这里强制点一次名单项，避免后台校验“未选择证书领取地址”。
+        """
+        # 先确认页面滚动/渲染到了证书领取区域
+        markers = ["新增联系地址"]
+        marker_found = False
+        for text in markers:
+            locator = page.get_by_text(text, exact=False)
+            if locator.count() == 0:
+                continue
+            try:
+                locator.first.wait_for(state="visible", timeout=4000)
+                marker_found = True
+                break
+            except TimeoutError:
+                continue
+
+        if not marker_found:
+            self._log(log, "未检测到证书领取地址区域，可能页面结构已变更，跳过自动点击")
+            return
+
+        def _is_empty_hint_visible() -> bool:
+            try:
+                page.get_by_text("暂无数据", exact=False).first.wait_for(state="visible", timeout=500)
+                return True
+            except TimeoutError:
+                return False
+
+        empty_hint = _is_empty_hint_visible()
+
+        if empty_hint:
+            self._log(log, "检测到证书领取地址为空状态，准备自动新增")
+            if not self._create_default_certificate_address(page, log):
+                self._log(log, "证书领取地址列表为空，且自动新增失败，可能需要人工处理")
+                return
+            page.wait_for_timeout(3000)
+            try:
+                page.get_by_role("listitem").filter(has_text=DEFAULT_CERT_CONTACT_NAME).click()
+            except Exception:
+                self._log(log, "点击新增联系人“朱砂”失败，可能需要人工确认")
+                return
+            self._log(log, f"点击证书领取地址：{DEFAULT_CERT_CONTACT_NAME}")
+            page.wait_for_timeout(500)
+            return
+
+        try:
+            marker = page.get_by_text("新增联系地址", exact=False).first
+            marker.wait_for(state="visible", timeout=3000)
+            target = marker.locator("xpath=following::li[1]")
+            target.wait_for(state="visible", timeout=3000)
+            full_text = target.inner_text().strip()
+            clicked_name = full_text.splitlines()[0].strip() if full_text else "默认联系人"
+            self._log(log, f"点击证书领取地址：{clicked_name}")
+            page.get_by_role("listitem").filter(has_text=clicked_name).click()
+
+        except Exception:
+            self._log(log, "点击联系人列表失败，可能需要人工确认")
+            return
+
+        self._log(log, f"点击证书领取地址：{clicked_name}")
+        page.wait_for_timeout(500)
+
+    def _create_default_certificate_address(self, page: Page, log: LogFn) -> bool:
+        """
+        当证书领取地址为空时，自动新增一个默认地址，减少人工干预。
+        """
+        page.get_by_text("+新增联系地址").click()
+        page.get_by_role("textbox", name="收件人（请填写真实姓名）").click()
+        page.get_by_role("textbox", name="收件人（请填写真实姓名）").fill("朱砂")
+        page.get_by_role("textbox", name="收件单位").click()
+        page.get_by_role("textbox", name="收件单位").fill("中国江苏徐州邳州市东湖街道汉府西侧环球新天地二栋")
+        page.locator(".box.large").click()
+        page.locator(".hd-option").first.click()
+        page.locator(".label").click()
+        page.get_by_text("江苏", exact=True).click()
+        page.get_by_text("徐州", exact=True).click()
+        page.get_by_text("邳州市", exact=True).click()
+        page.get_by_role("textbox", name="详细地址").click()
+        page.get_by_role("textbox", name="详细地址").fill("中国江苏徐州邳州市东湖街道汉府西侧环球新天地二栋")
+        page.get_by_role("textbox", name="邮编").click()
+        page.get_by_role("textbox", name="邮编").fill("221300")
+        page.get_by_role("textbox", name="请输入手机号码").click()
+        page.get_by_role("textbox", name="请输入手机号码").fill("18168245213")
+        page.get_by_role("button", name="保存", exact=True).click()
+        return True
+     
