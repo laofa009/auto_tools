@@ -38,7 +38,7 @@ class Task:
         self.config.setdefault("login_username", "")
         self.config.setdefault("login_password", "")
         self.config.setdefault("login_type", "机构")
-        self.config.setdefault("submit_role", "代理人")
+        self.config.setdefault("submit_role", "申请人")
         self._normalize_owners()
         if self.status in (TaskStatus.PENDING, TaskStatus.CONFIGURED):
             self._sync_status()

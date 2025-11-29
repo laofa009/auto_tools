@@ -61,7 +61,7 @@ class TaskUploader:
         self.default_username = default_username or os.environ.get("RZAPPLY_USERNAME", "Yf19942050676_")
         self.default_password = default_password or os.environ.get("RZAPPLY_PASSWORD", "Yf19942050676_")
         self.default_login_type = (default_login_type or os.environ.get("RZAPPLY_LOGIN_TYPE") or "机构").strip()
-        self.default_submit_role = (default_submit_role or os.environ.get("RZAPPLY_SUBMIT_ROLE") or "代理人").strip()
+        self.default_submit_role = (default_submit_role or os.environ.get("RZAPPLY_SUBMIT_ROLE") or "申请人").strip()
         self.last_login_username: str | None = None
         self.last_login_type: str | None = None
 
@@ -76,10 +76,9 @@ class TaskUploader:
     def _run(self, playwright: Playwright, task: Task, log: LogFn) -> dict[str, Path | None]:
         self._log(log, "启动浏览器")
         launch_args = ["--start-fullscreen"]
-        # browser = playwright.chromium.launch(headless=self.headless, args=launch_args)
-        # context = browser.new_context(storage_state=str(STORAGE_STATE))
         browser = playwright.chromium.launch(headless=self.headless, args=["--start-maximized"])
-        context = browser.new_context(no_viewport=True)
+        # 复用 storage_state 以避免同账号连续任务重复登录
+        context = browser.new_context(storage_state=str(STORAGE_STATE), no_viewport=True)
         page = context.new_page()
         self._log(log, "打开官网")
         page.goto("https://register.ccopyright.com.cn/registration.html#/index")

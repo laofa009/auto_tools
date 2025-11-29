@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -346,6 +346,19 @@ class TaskDetailWidget(QWidget):
         if self.current_task:
             self._sync_task_from_form()
 
+    def get_login_credentials(self) -> dict[str, str]:
+        """Return current login form values (trimmed)."""
+        return {
+            "login_type": self.login_type_input.currentText().strip(),
+            "submit_role": self.submit_role_input.currentText().strip(),
+            "login_username": self.login_username_input.text().strip(),
+            "login_password": self.login_password_input.text().strip(),
+        }
+
+    def sync_current_task(self) -> bool:
+        """Sync current form into task without triggering upload/save explicitly."""
+        return self._sync_task_from_form()
+
 
     def _add_owner_row(self, data: dict[str, str] | None = None) -> None:
         data = data or {}
@@ -453,6 +466,8 @@ class MainWindow(QMainWindow):
         self.tasks: list[Task] = []
         self.worker_threads: list[QThread] = []
         self.active_workers: list[UploadWorker] = []
+        self.upload_queue: list[Task] = []
+        self.current_upload_task: Task | None = None
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -470,6 +485,26 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._refresh_tasks)
         self.refresh_button.setEnabled(False)
         header_row.addWidget(self.refresh_button)
+
+        self.batch_upload_button = QPushButton("批量上传")
+        self.batch_upload_button.clicked.connect(self._handle_batch_upload)
+        self.batch_upload_button.setEnabled(False)
+        header_row.addWidget(self.batch_upload_button)
+
+        self.apply_all_button = QPushButton("账号应用到全部")
+        self.apply_all_button.clicked.connect(self._handle_apply_credentials_all)
+        self.apply_all_button.setEnabled(False)
+        header_row.addWidget(self.apply_all_button)
+
+        self.apply_owners_button = QPushButton("著作权人应用到全部")
+        self.apply_owners_button.clicked.connect(self._handle_apply_owners_all)
+        self.apply_owners_button.setEnabled(False)
+        header_row.addWidget(self.apply_owners_button)
+
+        self.delete_button = QPushButton("删除任务")
+        self.delete_button.clicked.connect(self._handle_delete_task)
+        self.delete_button.setEnabled(False)
+        header_row.addWidget(self.delete_button)
         left_panel.addLayout(header_row)
 
         self.dir_label = QLabel("未选择目录")
@@ -518,6 +553,11 @@ class MainWindow(QMainWindow):
             return
         self.tasks = self.loader.load_tasks()
         self._render_task_list()
+        has_tasks = bool(self.tasks)
+        self.batch_upload_button.setEnabled(has_tasks)
+        self.apply_all_button.setEnabled(has_tasks)
+        self.apply_owners_button.setEnabled(has_tasks)
+        self.delete_button.setEnabled(has_tasks and self.list_widget.currentItem() is not None)
         if self.tasks:
             self.list_widget.setCurrentRow(0)
         else:
@@ -565,6 +605,21 @@ class MainWindow(QMainWindow):
         item = self.list_widget.item(row)
         task = item.data(Qt.UserRole) if item else None
         self.detail_widget.set_task(task)
+        self._update_delete_button(task)
+
+    def _has_login_credentials(self, task: Task) -> bool:
+        username = str(task.config.get("login_username", "")).strip()
+        password = str(task.config.get("login_password", "")).strip()
+        return bool(username and password)
+
+    def _validate_ready_for_upload(self, task: Task) -> bool:
+        if not task.is_config_complete():
+            QMessageBox.warning(self, "配置不完整", "请填写完整的著作权人信息后再上传。")
+            return False
+        if not self._has_login_credentials(task):
+            QMessageBox.warning(self, "账号信息缺失", "请填写版权中心登录账号和密码后再上传。")
+            return False
+        return True
 
     def _handle_config_saved(self, task: Task) -> None:
         self._persist_state()
@@ -584,18 +639,98 @@ class MainWindow(QMainWindow):
             self._reselect_task(task)
 
     def _start_upload(self, task: Task) -> None:
-        if task.status == TaskStatus.UPLOADING:
+        if task.status == TaskStatus.UPLOADING or task is self.current_upload_task:
             QMessageBox.information(self, "上传中", "任务正在上传，请稍候。")
             return
-        if not task.is_config_complete():
-            QMessageBox.warning(self, "配置不完整", "请填写完整的著作权人信息后再上传。")
+        if not self._validate_ready_for_upload(task):
+            return
+        self._queue_task_upload(task)
+        self._update_delete_button(task)
+
+    def _queue_task_upload(self, task: Task) -> None:
+        if task in self.upload_queue:
+            self._append_log(f"{task.display_name()} · 已在上传队列中")
+            return
+        self.upload_queue.append(task)
+        self._append_log(f"{task.display_name()} · 加入上传队列（当前排队 {len(self.upload_queue)}）")
+        self._start_next_upload()
+
+    def _handle_batch_upload(self) -> None:
+        if not self.detail_widget.sync_current_task():
+            return
+        self._propagate_login_credentials()
+        self._persist_state()
+
+        if not self.tasks:
+            QMessageBox.information(self, "提示", "暂无任务可上传，请先选择 ZIP 目录并扫描。")
             return
 
+        uploadable: list[Task] = []
+        missing_config: list[Task] = []
+        missing_auth: list[Task] = []
+        in_progress: list[Task] = []
+        completed: list[Task] = []
+
+        for task in self.tasks:
+            if task.status == TaskStatus.UPLOADING:
+                in_progress.append(task)
+                continue
+            if task.status == TaskStatus.COMPLETED:
+                completed.append(task)
+                continue
+            if not task.is_config_complete():
+                missing_config.append(task)
+                continue
+            if not self._has_login_credentials(task):
+                missing_auth.append(task)
+                continue
+            uploadable.append(task)
+
+        if missing_config:
+            names = "、".join(t.display_name() for t in missing_config)
+            self._append_log(f"跳过配置不完整的任务：{names}")
+            QMessageBox.warning(self, "配置不完整", f"以下任务配置不完整，已跳过：\n{names}")
+
+        if missing_auth:
+            names = "、".join(t.display_name() for t in missing_auth)
+            self._append_log(f"跳过账号信息缺失的任务：{names}")
+            QMessageBox.warning(self, "账号信息缺失", f"以下任务缺少账号或密码，已跳过：\n{names}")
+
+        if in_progress:
+            names = "、".join(t.display_name() for t in in_progress)
+            self._append_log(f"跳过正在上传的任务：{names}")
+
+        if completed:
+            names = "、".join(t.display_name() for t in completed)
+            self._append_log(f"跳过已完成的任务：{names}")
+
+        if not uploadable:
+            QMessageBox.information(self, "无可上传任务", "没有可上传的任务，请检查配置或状态。")
+            return
+
+        self._append_log(
+            f"批量上传：可上传 {len(uploadable)} 个，配置缺失 {len(missing_config)}，账号缺失 {len(missing_auth)}，"
+            f"进行中 {len(in_progress)}，已完成 {len(completed)}"
+        )
+        for task in uploadable:
+            self._queue_task_upload(task)
+
+    def _start_next_upload(self) -> None:
+        if self.current_upload_task:
+            self._append_log("队列调度：已有任务正在上传，等待其完成")
+            return
+        if not self.upload_queue:
+            self._append_log("队列调度：没有等待上传的任务")
+            return
+        self._append_log(f"队列调度：准备开始下一个任务，排队剩余 {len(self.upload_queue)}")
+        task = self.upload_queue.pop(0)
+        self.current_upload_task = task
         task.status = TaskStatus.UPLOADING
         self._render_task_list()
         self._reselect_task(task)
         self._persist_state()
-        self._append_log(f"{task.display_name()} · 加入上传队列")
+        self._append_log(f"{task.display_name()} · 开始上传")
+        self._update_delete_button(task)
 
         thread = QThread()
         worker = UploadWorker(task, self.uploader)
@@ -612,6 +747,126 @@ class MainWindow(QMainWindow):
         self.worker_threads.append(thread)
         self.active_workers.append(worker)
 
+    def _propagate_login_credentials(self) -> None:
+        """Fill missing login credentials for all tasks using current form values."""
+        creds = self.detail_widget.get_login_credentials()
+        username = creds.get("login_username", "")
+        password = creds.get("login_password", "")
+        login_type = creds.get("login_type", "")
+        submit_role = creds.get("submit_role", "")
+
+        for task in self.tasks:
+            if not task.config.get("login_username"):
+                task.config["login_username"] = username
+            if not task.config.get("login_password"):
+                task.config["login_password"] = password
+            # 登录类型/办理身份：只填空，不覆盖已有值，避免不同账号/身份的任务被统一重写
+            if login_type and not task.config.get("login_type"):
+                task.config["login_type"] = login_type
+            if submit_role and not task.config.get("submit_role"):
+                task.config["submit_role"] = submit_role
+
+    def _handle_apply_credentials_all(self) -> None:
+        if not self.detail_widget.sync_current_task():
+            return
+        creds = self.detail_widget.get_login_credentials()
+        username = creds.get("login_username", "").strip()
+        password = creds.get("login_password", "").strip()
+        login_type = creds.get("login_type", "").strip()
+        submit_role = creds.get("submit_role", "").strip()
+        if not username or not password:
+            QMessageBox.warning(self, "账号信息缺失", "请先填写账号和密码，再应用到全部任务。")
+            return
+
+        for task in self.tasks:
+            task.update_config(
+                {
+                    "login_username": username,
+                    "login_password": password,
+                    "login_type": login_type or task.config.get("login_type", ""),
+                    "submit_role": submit_role or task.config.get("submit_role", ""),
+                }
+            )
+
+        self._persist_state()
+        self._render_task_list()
+        current = self.list_widget.currentItem()
+        if current:
+            self.detail_widget.set_task(current.data(Qt.UserRole))
+        self._append_log("账号信息已应用到全部任务")
+
+    def _handle_apply_owners_all(self) -> None:
+        if not self.detail_widget.sync_current_task():
+            return
+        source_task = self.detail_widget.current_task
+        if not source_task:
+            QMessageBox.information(self, "提示", "请先选择任务。")
+            return
+        owners = source_task.config.get("owners") or []
+        if not owners:
+            QMessageBox.warning(self, "著作权人信息缺失", "当前任务未填写著作权人信息，无法应用。")
+            return
+
+        applied = 0
+        skipped = 0
+        for task in self.tasks:
+            # 只给空的任务填充，避免覆盖特殊任务
+            if task.config.get("owners"):
+                skipped += 1
+                continue
+            task.update_config({"owners": owners})
+            applied += 1
+
+        self._persist_state()
+        self._render_task_list()
+        current = self.list_widget.currentItem()
+        if current:
+            self.detail_widget.set_task(current.data(Qt.UserRole))
+        self._append_log(f"著作权人信息已应用到全部任务：填充 {applied} 个，保留已有 {skipped} 个")
+
+    def _handle_delete_task(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            QMessageBox.information(self, "提示", "请先选择要删除的任务。")
+            return
+        task = item.data(Qt.UserRole)
+        if not isinstance(task, Task):
+            return
+        if task is self.current_upload_task or task.status == TaskStatus.UPLOADING:
+            QMessageBox.warning(self, "无法删除", "任务正在上传，完成后再删除。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "删除确认",
+            f"确定要删除任务 “{task.display_name()}” 吗？不会删除 ZIP/解压文件。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 如果在队列中，移除
+        if task in self.upload_queue:
+            self.upload_queue = [t for t in self.upload_queue if t is not task]
+            self._append_log(f"{task.display_name()} · 已从上传队列移除")
+
+        # 从任务列表移除并更新 UI
+        try:
+            self.tasks.remove(task)
+        except ValueError:
+            pass
+
+        self._render_task_list()
+        if self.tasks:
+            self.list_widget.setCurrentRow(0)
+            self.detail_widget.set_task(self.list_widget.item(0).data(Qt.UserRole))
+        else:
+            self.detail_widget.set_task(None)
+        self._persist_state()
+        self._append_log(f"{task.display_name()} · 已删除（文件未删除）")
+        self._update_delete_button(self.list_widget.currentItem().data(Qt.UserRole) if self.list_widget.currentItem() else None)
+
     def _handle_upload_finished(self, task: Task, success: bool, message: str) -> None:
         task.status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
         self._persist_state()
@@ -621,10 +876,15 @@ class MainWindow(QMainWindow):
 
         if success:
             self._append_log(f"{task.display_name()} · 上传成功")
-            QMessageBox.information(self, "上传成功", message)
         else:
             self._append_log(f"{task.display_name()} · 上传失败：{message}")
             QMessageBox.critical(self, "上传失败", message)
+
+        self.current_upload_task = None
+        self._append_log(f"队列剩余 {len(self.upload_queue)} 个等待上传")
+        # 异步调度下一个，避免在信号回调里直接启动新线程导致交叉
+        QTimer.singleShot(0, self._start_next_upload)
+        self._update_delete_button(self.list_widget.currentItem().data(Qt.UserRole) if self.list_widget.currentItem() else None)
 
     def _reselect_task(self, task: Task) -> None:
         for row in range(self.list_widget.count()):
@@ -633,6 +893,18 @@ class MainWindow(QMainWindow):
                 self.list_widget.setCurrentRow(row)
                 item.setText(self._format_task_label(task))
                 break
+        self._update_delete_button(task)
+
+    def _update_delete_button(self, task: Task | None) -> None:
+        if not task:
+            self.delete_button.setEnabled(False)
+            return
+        if task is self.current_upload_task or task.status == TaskStatus.UPLOADING:
+            self.delete_button.setEnabled(False)
+        else:
+            self.delete_button.setEnabled(True)
+        self.apply_all_button.setEnabled(bool(self.tasks))
+        self.apply_owners_button.setEnabled(bool(self.tasks))
 
     def _persist_state(self) -> None:
         if not self.files_dir:

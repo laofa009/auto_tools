@@ -78,7 +78,7 @@ class TaskLoader:
             "login_username": "",
             "login_password": "",
             "login_type": "机构",
-            "submit_role": "代理人",
+            "submit_role": "申请人",
         }
 
     def _is_config_complete(self, config: Dict[str, List[Dict[str, str]]]) -> bool:
