@@ -462,7 +462,6 @@ class MainWindow(QMainWindow):
 
         self.files_dir: Path | None = None
         self.loader: TaskLoader | None = None
-        self.uploader = TaskUploader()
         self.tasks: list[Task] = []
         self.worker_threads: list[QThread] = []
         self.active_workers: list[UploadWorker] = []
@@ -733,7 +732,8 @@ class MainWindow(QMainWindow):
         self._update_delete_button(task)
 
         thread = QThread()
-        worker = UploadWorker(task, self.uploader)
+        # 每个任务独立创建 TaskUploader，避免跨线程复用 Playwright 对象
+        worker = UploadWorker(task, TaskUploader())
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._handle_upload_finished)

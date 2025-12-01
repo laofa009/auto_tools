@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import re
 from pathlib import Path
 from playwright.sync_api import Locator, Page
@@ -15,6 +16,7 @@ from models import DEFAULT_OWNER_TYPE, OWNER_TYPE_ID_OPTIONS, Task
 
 AUTH_DIR = Path("playwright/.auth")
 STORAGE_STATE = AUTH_DIR / "storage_state.json"
+STORAGE_META = AUTH_DIR / "storage_meta.json"
 
 MS_PLAYWRIGHT = (
     Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -64,22 +66,97 @@ class TaskUploader:
         self.default_submit_role = (default_submit_role or os.environ.get("RZAPPLY_SUBMIT_ROLE") or "申请人").strip()
         self.last_login_username: str | None = None
         self.last_login_type: str | None = None
+        self._playwright: Playwright | None = None
+        self._browser = None
+        self._context = None
 
     def upload(self, task: Task, log: LogFn = None) -> dict[str, Path | None]:
         self._log(log, f"开始上传：{task.display_name()}")
         ensure_storage_state_file()
-        with sync_playwright() as playwright:
-            artifacts = self._run(playwright, task, log)
+        self._load_state_meta()
+        artifacts = self._run(task, log)
         self._log(log, "上传流程结束")
         return artifacts
 
-    def _run(self, playwright: Playwright, task: Task, log: LogFn) -> dict[str, Path | None]:
-        self._log(log, "启动浏览器")
-        launch_args = ["--start-fullscreen"]
-        browser = playwright.chromium.launch(headless=self.headless, args=["--start-maximized"])
-        # 复用 storage_state 以避免同账号连续任务重复登录
-        context = browser.new_context(storage_state=str(STORAGE_STATE), no_viewport=True)
-        page = context.new_page()
+    def _ensure_playwright(self) -> None:
+        if not self._playwright:
+            self._playwright = sync_playwright().start()
+
+    def _close_context(self) -> None:
+        try:
+            if self._context:
+                self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        self._context = None
+        self._browser = None
+
+    def _load_state_meta(self) -> None:
+        text: str | None = None
+        try:
+            text = STORAGE_META.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # 兼容旧版本使用系统默认编码写入的文件，例如 Windows 上的 cp936
+            try:
+                text = STORAGE_META.read_text()
+            except Exception:
+                text = None
+        except FileNotFoundError:
+            text = None
+        except Exception:
+            text = None
+
+        if not text:
+            self.last_login_username = None
+            self.last_login_type = None
+            return
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            self.last_login_username = None
+            self.last_login_type = None
+            return
+
+        self.last_login_username = data.get("username") or None
+        self.last_login_type = data.get("login_type") or None
+
+    def _save_state_meta(self, username: str, login_type: str) -> None:
+        try:
+            STORAGE_META.parent.mkdir(parents=True, exist_ok=True)
+            STORAGE_META.write_text(
+                json.dumps({"username": username, "login_type": login_type}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _get_context(self, task: Task, log: LogFn):
+        username, password, login_type, submit_role = self._get_login_context(task)
+        need_new = False
+        if not self._context or not self._browser or not self._browser.is_connected():
+            need_new = True
+        else:
+            if self.last_login_username and (
+                self.last_login_username != username or (self.last_login_type or "") != login_type
+            ):
+                need_new = True
+        if need_new:
+            self._log(log, "启动浏览器")
+            self._close_context()
+            self._ensure_playwright()
+            self._browser = self._playwright.chromium.launch(headless=self.headless, args=["--start-maximized"])
+            self._context = self._browser.new_context(storage_state=str(STORAGE_STATE), no_viewport=True)
+        page = self._context.new_page()
+        return page, username, password, login_type, submit_role
+
+    def _run(self, task: Task, log: LogFn) -> dict[str, Path | None]:
+        page, username, password, login_type, submit_role = self._get_context(task, log)
         self._log(log, "打开官网")
         page.goto("https://register.ccopyright.com.cn/registration.html#/index")
         skip_button = page.get_by_text("跳过")
@@ -89,18 +166,11 @@ class TaskUploader:
         # with page.expect_popup() as page1_info:
         #     page.locator(".pic > a").first.click()
         # page1 = page1_info.value
-        self._log(log, "进入办理页面")
-        try:
-            button = page.get_by_role("cell", name="R11").get_by_role("button")
-            button.wait_for(state="visible", timeout=5000)
-            button.click()
-        except TimeoutError:
-            self._log(log, "未找到 R11 入口按钮，可能已经在办理页面")
+        self._enter_application_page(page, log)
 
-        username, password, login_type, submit_role = self._get_login_context(task)
-        if self._login_if_needed(context, page, username, password, login_type, log):
+        if self._login_if_needed(self._context, page, username, password, login_type, log):
             self._log(log, "登录成功，保存 storage_state")
-            context.storage_state(path=str(STORAGE_STATE))
+            self._context.storage_state(path=str(STORAGE_STATE))
             self.last_login_username = username
             self.last_login_type = login_type
 
@@ -117,8 +187,7 @@ class TaskUploader:
         self._log(log, "填写软件功能与特点")
         sign_pdf_path = self._fill_soft_feature_form(page, task, login_type, submit_role, log)
         self._log(log, "页面操作完成，关闭浏览器")
-        context.close()
-        browser.close()
+        page.close()
         return {"sign_page_pdf": sign_pdf_path}
 
     def _get_login_context(self, task: Task) -> tuple[str, str, str, str]:
@@ -160,12 +229,7 @@ class TaskUploader:
                 page.locator(".soft").click(timeout=5000)
             except Exception:
                 pass
-            try:
-                entry = page.get_by_role("cell", name="R11").get_by_role("button")
-                entry.wait_for(state="visible", timeout=5000)
-                entry.click()
-            except TimeoutError:
-                self._log(log, "强制登录时未找到 R11 入口按钮，可能已经在办理页面")
+            self._enter_application_page(page, log)
             username_input = page.get_by_role("textbox", name="请输入用户名/手机号/邮箱")
             try:
                 username_input.wait_for(state="visible", timeout=5000)
@@ -185,15 +249,28 @@ class TaskUploader:
             password_input.click()
             password_input.fill(password)
             page.get_by_role("button", name="立即登录").click()
-            try:
-                button = page.get_by_role("cell", name="R11").get_by_role("button")
-                button.wait_for(state="visible", timeout=5000)
-                button.click()
-            except TimeoutError:
-                self._log(log, "未找到 R11 入口按钮，可能已经在办理页面")
+            self._enter_application_page(page, log)
+            self._save_state_meta(username, login_type)
             return True
         self._log(log, "保持登录状态，无需重新登录")
         return False
+
+    def _enter_application_page(self, page: Page, log: LogFn, retry: int = 2, wait_ms: int = 8000) -> None:
+        """Try to click R11 entry; tolerate慢加载，避免误判没有按钮。"""
+        self._log(log, "进入办理页面")
+        for idx in range(retry + 1):
+            try:
+                button = page.get_by_role("cell", name="R11").get_by_role("button")
+                button.wait_for(state="visible", timeout=wait_ms)
+                button.click()
+                return
+            except TimeoutError:
+                if idx < retry:
+                    self._log(log, f"R11 入口未出现，重试 {idx + 1}/{retry}")
+                    page.wait_for_timeout(1000)
+                    continue
+                self._log(log, "未找到 R11 入口按钮，可能已经在办理页面")
+                return
 
     def _fill_basic_form(self, page, task: Task) -> None:
         # config = task.config
