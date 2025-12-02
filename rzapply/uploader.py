@@ -183,7 +183,7 @@ class TaskUploader:
         self._log(log, "填写软件申请信息")
         self._fill_basic_form(page, task)
         self._log(log, "填写软件开发信息")
-        self._fill_soft_dev_info_form(page, task, login_type, submit_role)
+        self._fill_soft_dev_info_form(page, task, login_type, submit_role, log)
         self._log(log, "填写软件功能与特点")
         sign_pdf_path = self._fill_soft_feature_form(page, task, login_type, submit_role, log)
         self._log(log, "页面操作完成，关闭浏览器")
@@ -284,7 +284,14 @@ class TaskUploader:
         page.get_by_role("textbox", name="请输入版本号").fill(task.meta.get("version", "V1.0"))
         page.get_by_role("button", name="下一步").click()
 
-    def _fill_soft_dev_info_form(self, page, task: Task, login_type: str, submit_role: str) -> None:
+    def _fill_soft_dev_info_form(
+        self,
+        page,
+        task: Task,
+        login_type: str,
+        submit_role: str,
+        log: LogFn,
+    ) -> None:
         if submit_role == "申请人":
             software_category = task.meta.get("software_category", "应用软件")
             if software_category not in ["应用软件", "嵌入式软件", "中间件", "操作系统"]:
@@ -303,9 +310,9 @@ class TaskUploader:
                 self._select_date_in_picker(page, completion_date)
               except Exception as e:
                 # 如果日期控件结构变化，日志里能看到
-                self._log("选择完成日期失败：{completion_date}，错误：{e}")
+                self._log(log, f"选择完成日期失败：{completion_date}，错误：{e}")
 
-            page.get_by_text("未发表").click()
+            page.get_by_text("未发表").click(force=True)
             next_button = page.get_by_role("button", name="下一步")
             next_button.wait_for(state="visible", timeout=20000)
             next_button.click()
@@ -327,9 +334,9 @@ class TaskUploader:
             try:
                 self._select_date_in_picker(page, completion_date)
             except Exception as e:
-            # 如果日期控件结构变化，日志里能看到
-               self._log("选择完成日期失败：{completion_date}，错误：{e}")
-        page.get_by_text("未发表").click()
+                # 如果日期控件结构变化，日志里能看到
+                self._log(log, f"选择完成日期失败：{completion_date}，错误：{e}")
+        page.get_by_text("未发表").click(force=True)
         page.locator(".country_select > .hd-select > .box").click()
         page.locator(".country_select > .hd-select > .dropdown > .hd_scroll > .hd_scroll_content > div").first.click()
         page.locator(".label > .icon").click()
@@ -390,17 +397,47 @@ class TaskUploader:
 
         # 2. 选择年份
         page.get_by_text("年").first.click()
-        page.get_by_text(f"{year}年", exact=True).click()
+        self._click_active_dropdown_option(page, f"{year}年")
 
         # 3. 选择月份
         page.get_by_text("月").first.click()
-        page.get_by_text(f"{month_int}月", exact=True).click()
+        self._click_active_dropdown_option(page, f"{month_int}月")
 
         # 4. 选择日（用 role=cell 更稳）
         page.get_by_role("cell", name=str(day_int)).click()
 
         # 5. 让焦点离开，触发表单校验
         page.keyboard.press("Tab")
+
+    def _click_active_dropdown_option(self, page: Page, text: str) -> None:
+        """
+        日期控件的年份 / 月份下拉在 strict 模式下会匹配到多个元素，用该方法只点击下拉菜单中处于展开状态的选项。
+        """
+        # 只看当前弹出的下拉面板（默认是最后一个可见的 hd_selectDropdown）
+        panel = page.locator("div.hd_selectDropdown").filter(has=page.locator("div.menu")).last
+        try:
+            panel.wait_for(state="visible", timeout=2000)
+        except TimeoutError:
+            pass
+
+        options = panel.locator("div.menu")
+        total = options.count()
+        for idx in range(total):
+            option = options.nth(idx)
+            try:
+                if not option.is_visible():
+                    continue
+                if option.inner_text().strip() == text:
+                    option.click()
+                    return
+            except Exception:
+                continue
+
+        # 如果没有匹配项，兜底尝试精确文本定位
+        fallback = page.get_by_text(text, exact=True)
+        if fallback.count() == 0:
+            raise RuntimeError(f"未在下拉选项中找到文本：{text}")
+        fallback.first.click()
 
     def _fill_soft_feature_form(
         self,
