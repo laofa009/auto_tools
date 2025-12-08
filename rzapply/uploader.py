@@ -9,6 +9,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Callable, Sequence
+from slider_solver import JfbymSliderSolver
 
 from playwright.sync_api import Playwright, TimeoutError, sync_playwright
 
@@ -249,6 +250,30 @@ class TaskUploader:
             password_input.click()
             password_input.fill(password)
             page.get_by_role("button", name="立即登录").click()
+            # ======== 【开始植入】自动滑块验证 ========
+            try:
+                self._log(log, "正在尝试自动识别并拖动滑块...") # 沿用你们项目里的 log 风格
+                
+                # 实例化求解器 (记得替换 TOKEN)
+                solver = JfbymSliderSolver(api_token="6CxDMsv0EubKdWsu1ru2FCnCvuN_iNs3nmFUCkUQ_mc")
+                
+                # 定义选择器 (之前测试好的)
+                bg_sel = "img[class*='bg-img'], .verify-img-panel img"
+                btn_sel = ".yidun_jigsaw, .verify-move-block, img[alt='验证码滑块']"
+                
+                # 执行破解 (传入之前测试出的黄金 Offset=25)
+                # 注意：截图里看不出是 async 还是 sync。
+                # 如果函数定义是 async def ...: 用 await solver.run(...)
+                # 如果函数定义是 def ...: 这里可能需要用 asyncio.run(...) 或者改为同步版，但通常 playwright 是异步的，假设是 await
+                solver.run(page, bg_sel, btn_sel, offset=10)
+                
+                self._log(log, "滑块验证执行完毕")
+                
+            except Exception as e:
+                self._log(log, f"自动滑块出现异常: {e}")
+                # 如果自动失败，可以选择抛出错误，或者在这里暂停让人工介入
+                # await page.pause() 
+            # ======== 【植入结束】 ========
             self._enter_application_page(page, log)
             self._save_state_meta(username, login_type)
             return True
