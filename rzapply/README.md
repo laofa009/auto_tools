@@ -2,6 +2,51 @@
 
 图形界面工具会扫描 `files/` 目录下的每个 ZIP 包、读取其中的 `meta.json`，并为每个任务提供一套可编辑的字段。完成配置后点击“上传任务”即可触发基于 Playwright 的自动化流程。
 
+## 命令行 Agent（服务器下发任务）
+
+为了让服务器统一调度，在客户端这一侧新增了 `agent.py`，它会向中心服务注册、发送心跳并轮询任务，收到任务后直接复用现有的 `TaskLoader`/`TaskUploader` 执行 Playwright 流程。
+
+运行方式：
+
+```bash
+uv pip install -r pyproject.toml
+python agent.py --server http://api.example.com
+```
+
+常用参数 / 环境变量：
+
+- `--server` / `RZAPPLY_AGENT_SERVER`：API 基地址，需提供 `/register`、`/heartbeat`、`/task`、`/task_result` 四个接口。
+- `/tasks/enqueue`：POST JSON（需提供 `zip_url` 或 `zip_base64`），把任务加入队列。
+- `/tasks/enqueue/upload`：直接上传 ZIP（`multipart/form-data`），服务器会转成 base64 后放入队列，可额外传入 `login_username`、`config_json`、`headless` 等字段。
+- `--token` / `RZAPPLY_AGENT_TOKEN`：可选 Bearer Token。
+- `--headless`：`auto`（默认，按环境变量）、`true`、`false`。ENV `RZAPPLY_AGENT_HEADLESS` 覆盖全局默认。
+- `--heartbeat`、`--poll`、`--long-poll`：控制心跳与长轮询间隔。
+
+任务下发协议（示例）：
+
+```json
+{
+  "task_id": "demo-001",
+  "zip_url": "https://server/path/task.zip",
+  "config": {
+    "login_username": "...",
+    "login_password": "...",
+    "submit_role": "申请人"
+  },
+  "cleanup": true,
+  "headless": false
+}
+```
+
+Agent 会：
+
+1. 下载/解码 ZIP（也支持 `zip_base64`）并使用 `TaskLoader` 解析任务；
+2. 按 `config` 覆盖登录、owners 等字段；
+3. 运行 `TaskUploader`，写入日志与产物列表；
+4. 将 `status`、`reason`、日志、产物路径回传到 `/task_result`。
+
+所有运行期文件保存在 `agent_runtime/<task_id>/`，可通过 `RZAPPLY_AGENT_RUNTIME` 自定义，并沿用 `playwright/.auth` 目录复用登录态。这样服务器只负责调度，浏览器依旧在客户端本地运行，方便人工介入验证码等动作。
+
 ### 准备工作
 
 1. 准备一个目录放置所有待处理的 ZIP（每个压缩包需包含 `meta.json`）。
