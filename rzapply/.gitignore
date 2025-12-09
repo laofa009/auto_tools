@@ -22,3 +22,8 @@ ms-playwright
 image
 api_runtime
 tasks_output
+
+software_copyright_output/
+task_status/
+tasks_output/
+agent_runtime/

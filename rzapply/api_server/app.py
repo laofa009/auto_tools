@@ -12,11 +12,11 @@ import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 # Ensure the existing rzapply modules are importable when running from api_server.
@@ -52,6 +52,8 @@ AGENT_RUNNING_TASKS: Dict[str, Dict[str, Any]] = {}
 AGENT_CLIENTS: Dict[str, Dict[str, Any]] = {}
 AGENT_RESULTS: Dict[str, Dict[str, Any]] = {}
 AGENT_LOCK = asyncio.Lock()
+AGENT_WS_CONNECTIONS: Dict[str, WebSocket] = {}
+AGENT_WS_IDLE: Set[str] = set()
 
 
 def _persist_upload(file: UploadFile, target_dir: Path) -> Path:
@@ -115,6 +117,13 @@ def _resolve_sign_pdf_path(bucket: str, filename: str | None = None) -> Path | N
 
     pdfs = sorted(base.glob("*_签章页.pdf"), key=lambda p: p.stat().st_mtime)
     return pdfs[-1] if pdfs else None
+
+
+def _build_ws_url(request: Request) -> str:
+    base_url = request.base_url
+    scheme = "wss" if base_url.scheme == "https" else "ws"
+    port = f":{base_url.port}" if base_url.port else ""
+    return f"{scheme}://{base_url.hostname}{port}/agent/ws"
 
 
 @app.on_event("startup")
@@ -196,6 +205,97 @@ def _require_agent_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+async def _record_task_result(payload: TaskResultPayload) -> None:
+    async with AGENT_LOCK:
+        AGENT_RESULTS[payload.task_id] = payload.dict()
+        AGENT_RUNNING_TASKS.pop(payload.task_id, None)
+        client = AGENT_CLIENTS.get(payload.client_id)
+        if client:
+            client["status"] = "idle"
+            client["task_id"] = None
+            client["last_seen"] = datetime.utcnow().isoformat()
+            if payload.client_id in AGENT_WS_CONNECTIONS:
+                AGENT_WS_IDLE.add(payload.client_id)
+    await _dispatch_tasks()
+
+
+async def _requeue_task(task: Dict[str, Any]) -> None:
+    async with AGENT_LOCK:
+        AGENT_PENDING_TASKS.appendleft(task)
+
+
+async def _mark_client_idle(client_id: str) -> None:
+    async with AGENT_LOCK:
+        if client_id in AGENT_WS_CONNECTIONS:
+            AGENT_WS_IDLE.add(client_id)
+        client = AGENT_CLIENTS.get(client_id)
+        if client:
+            client["status"] = "idle"
+            client["task_id"] = None
+            client["last_seen"] = datetime.utcnow().isoformat()
+
+
+async def _drop_ws_connection(client_id: str) -> None:
+    requeue_tasks: List[Dict[str, Any]] = []
+    async with AGENT_LOCK:
+        AGENT_WS_CONNECTIONS.pop(client_id, None)
+        AGENT_WS_IDLE.discard(client_id)
+        for task_id, info in list(AGENT_RUNNING_TASKS.items()):
+            if info.get("client_id") == client_id and info.get("channel") == "ws":
+                requeue_tasks.append(info["task"])
+                AGENT_RUNNING_TASKS.pop(task_id, None)
+        client = AGENT_CLIENTS.get(client_id)
+        if client:
+            client["status"] = "offline"
+            client["task_id"] = None
+            client["last_seen"] = datetime.utcnow().isoformat()
+    for task in requeue_tasks:
+        await _requeue_task(task)
+    if requeue_tasks:
+        await _dispatch_tasks()
+
+
+async def _dispatch_tasks() -> None:
+    assignments: List[Tuple[str, Dict[str, Any]]] = []
+    async with AGENT_LOCK:
+        idle_clients = [cid for cid in AGENT_WS_IDLE if cid in AGENT_WS_CONNECTIONS]
+        print(f"[dispatch] pending={len(AGENT_PENDING_TASKS)} idle_clients={idle_clients}")
+        while AGENT_PENDING_TASKS and idle_clients:
+            client_id = idle_clients.pop(0)
+            ws = AGENT_WS_CONNECTIONS.get(client_id)
+            if not ws:
+                continue
+            task = AGENT_PENDING_TASKS.popleft()
+            task_id = str(task.get("task_id") or uuid.uuid4().hex)
+            task["task_id"] = task_id
+            AGENT_RUNNING_TASKS[task_id] = {
+                "client_id": client_id,
+                "task": task,
+                "started_at": datetime.utcnow().isoformat(),
+                "channel": "ws",
+            }
+            client = AGENT_CLIENTS.get(client_id)
+            if client:
+                client["status"] = "running"
+                client["task_id"] = task_id
+                client["last_seen"] = datetime.utcnow().isoformat()
+            AGENT_WS_IDLE.discard(client_id)
+            print(f"[dispatch] assign task_id={task_id} -> client={client_id}")
+            assignments.append((client_id, task))
+    for client_id, task in assignments:
+        ws = AGENT_WS_CONNECTIONS.get(client_id)
+        if not ws:
+            await _requeue_task(task)
+            continue
+        try:
+            await ws.send_json({"type": "task", "payload": task})
+            print(f"[dispatch] sent task_id={task.get('task_id')} to {client_id}")
+        except Exception:
+            print(f"[dispatch] failed to send task_id={task.get('task_id')} to {client_id}, requeueing")
+            await _requeue_task(task)
+            await _drop_ws_connection(client_id)
+
+
 @app.post("/register")
 async def register_agent(payload: RegisterPayload, request: Request) -> Dict[str, Any]:
     _require_agent_auth(request)
@@ -211,7 +311,131 @@ async def register_agent(payload: RegisterPayload, request: Request) -> Dict[str
     }
     async with AGENT_LOCK:
         AGENT_CLIENTS[client_id] = client_data
-    return {"client_id": client_id}
+    response = {
+        "client_id": client_id,
+        "supports_ws": True,
+        "ws_url": _build_ws_url(request),
+    }
+    return response
+
+
+@app.websocket("/agent/ws")
+async def agent_ws_endpoint(websocket: WebSocket) -> None:
+    if AGENT_TOKEN:
+        auth_header = websocket.headers.get("Authorization")
+        token_ok = False
+        if auth_header == f"Bearer {AGENT_TOKEN}":
+            token_ok = True
+        else:
+            # allow token provided as query parameter for clients that cannot set headers
+            try:
+                token_q = websocket.query_params.get("token")
+                if token_q == AGENT_TOKEN:
+                    token_ok = True
+            except Exception:
+                token_ok = False
+        if not token_ok:
+            await websocket.close(code=4401, reason="unauthorized")
+            return
+
+    await websocket.accept()
+    client_id: Optional[str] = None
+    try:
+        register_packet = await websocket.receive_json()
+        if not isinstance(register_packet, dict) or register_packet.get("type") != "register":
+            await websocket.close(code=4400, reason="first message must be register")
+            return
+
+        try:
+            payload = RegisterPayload(**(register_packet.get("payload") or {}))
+        except ValidationError as exc:
+            await websocket.close(code=4400, reason=f"invalid register payload: {exc}")
+            return
+
+        client_id = payload.client_id or uuid.uuid4().hex
+        client_data = {
+            "client_id": client_id,
+            "hostname": payload.hostname or "",
+            "platform": payload.platform or "",
+            "python_version": payload.python_version or "",
+            "headless": payload.headless,
+            "status": "idle",
+            "last_seen": datetime.utcnow().isoformat(),
+        }
+
+        async with AGENT_LOCK:
+            AGENT_CLIENTS[client_id] = client_data
+            AGENT_WS_CONNECTIONS[client_id] = websocket
+            AGENT_WS_IDLE.add(client_id)
+
+        await websocket.send_json(
+            {
+                "type": "register_ack",
+                "payload": {
+                    "client_id": client_id,
+                    "heartbeat_interval": 30,
+                    "supports_ws": True,
+                },
+            }
+        )
+        await _dispatch_tasks()
+
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                continue
+            msg_type = message.get("type")
+            payload = message.get("payload") or {}
+
+            if msg_type == "heartbeat":
+                async with AGENT_LOCK:
+                    client = AGENT_CLIENTS.get(client_id)
+                    if client:
+                        client["status"] = payload.get("status", client["status"])
+                        client["task_id"] = payload.get("task_id")
+                        client["last_seen"] = datetime.utcnow().isoformat()
+                        if payload.get("status") == "idle":
+                            AGENT_WS_IDLE.add(client_id)
+                await websocket.send_json({"type": "heartbeat_ack"})
+                if payload.get("status") == "idle":
+                    await _dispatch_tasks()
+            elif msg_type == "task_ack":
+                task_id = payload.get("task_id")
+                accepted = payload.get("accepted", True)
+                if not task_id:
+                    continue
+                if not accepted:
+                    info = None
+                    async with AGENT_LOCK:
+                        info = AGENT_RUNNING_TASKS.pop(task_id, None)
+                    if info:
+                        await _requeue_task(info["task"])
+                    await _mark_client_idle(client_id)
+                    await _dispatch_tasks()
+            elif msg_type == "result":
+                result_payload = dict(payload or {})
+                result_payload["client_id"] = client_id
+                try:
+                    result_model = TaskResultPayload(**result_payload)
+                except ValidationError as exc:
+                    await websocket.send_json({"type": "error", "payload": {"message": f"invalid result payload: {exc}"}})
+                    continue
+                await _record_task_result(result_model)
+                await websocket.send_json({"type": "result_ack", "payload": {"task_id": result_model.task_id}})
+            elif msg_type == "log":
+                # 暂时仅打印日志，后续可持久化
+                log_line = payload.get("message")
+                if log_line:
+                    print(f"[agent-log {client_id}] {log_line}")
+            else:
+                await websocket.send_json({"type": "error", "payload": {"message": f"unknown message type: {msg_type}"}})
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[agent-ws] connection error: {exc}")
+    finally:
+        if client_id:
+            await _drop_ws_connection(client_id)
 
 
 @app.post("/heartbeat")
@@ -240,6 +464,7 @@ async def enqueue_task(payload: EnqueueTaskPayload, request: Request) -> Dict[st
     async with AGENT_LOCK:
         AGENT_PENDING_TASKS.append(task_data)
         pending = len(AGENT_PENDING_TASKS)
+    await _dispatch_tasks()
     return {"task_id": task_data["task_id"], "pending": pending}
 
 
@@ -317,6 +542,7 @@ async def enqueue_upload_task(
     async with AGENT_LOCK:
         AGENT_PENDING_TASKS.append(payload)
         pending = len(AGENT_PENDING_TASKS)
+    await _dispatch_tasks()
     return {"task_id": payload["task_id"], "pending": pending}
 
 
@@ -354,14 +580,7 @@ async def fetch_task(request: Request, client_id: str, timeout: int = 25):
 @app.post("/task_result")
 async def task_result(payload: TaskResultPayload, request: Request) -> Dict[str, Any]:
     _require_agent_auth(request)
-    async with AGENT_LOCK:
-        AGENT_RESULTS[payload.task_id] = payload.dict()
-        AGENT_RUNNING_TASKS.pop(payload.task_id, None)
-        client = AGENT_CLIENTS.get(payload.client_id)
-        if client:
-            client["status"] = "idle"
-            client["task_id"] = None
-            client["last_seen"] = datetime.utcnow().isoformat()
+    await _record_task_result(payload)
     return {"ok": True}
 
 
@@ -470,6 +689,31 @@ async def upload_task(
         "files": saved_files,
     }
     return _api_response(data, result_message, success=(result_status == "success"), status_code=http_status)
+
+
+@app.get("/debug/agents")
+async def debug_agents(request: Request) -> JSONResponse:
+    """临时调试接口：返回 agent 队列与连接的当前内存状态。
+
+    注意：该接口仅用于调试，可能暴露内部信息；如果配置了 `AGENT_TOKEN`，仍需通过 `Authorization` 头访问。
+    """
+    _require_agent_auth(request)
+    async with AGENT_LOCK:
+        pending = list(AGENT_PENDING_TASKS)
+        running = {k: v for k, v in AGENT_RUNNING_TASKS.items()}
+        clients = {k: v for k, v in AGENT_CLIENTS.items()}
+        ws_connected = list(AGENT_WS_CONNECTIONS.keys())
+        ws_idle = list(AGENT_WS_IDLE)
+
+    data = {
+        "pending_count": len(pending),
+        "pending_tasks": [t.get("task_id") or None for t in pending],
+        "running_tasks": list(running.keys()),
+        "clients": clients,
+        "ws_connected_clients": ws_connected,
+        "ws_idle_clients": ws_idle,
+    }
+    return _api_response(data, "ok")
 
 
 if __name__ == "__main__":
