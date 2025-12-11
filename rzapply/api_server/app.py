@@ -44,7 +44,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-DEFAULT_HEADLESS = _env_flag("RZAPPLY_HEADLESS", False)
+DEFAULT_HEADLESS = _env_flag("RZAPPLY_HEADLESS", True)
 
 AGENT_TOKEN = (os.environ.get("RZAPPLY_AGENT_TOKEN") or "").strip()
 AGENT_PENDING_TASKS = deque()
@@ -671,10 +671,12 @@ async def upload_task(
     try:
         artifacts = await run_in_threadpool(_run_upload)
         saved_files = _persist_artifacts(artifacts, provided_task_id or run_id)
+        flow_number = artifacts.get("flow_number")
     except Exception as exc:  # noqa: BLE001
         result_status = "failed"
         result_message = f"上传失败：{exc}"
         http_status = 500
+        flow_number = None
     finally:
         if cleanup:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -687,33 +689,9 @@ async def upload_task(
         "reason": result_message,
         "logs": log_lines,
         "files": saved_files,
+        "flow_number": flow_number,
     }
     return _api_response(data, result_message, success=(result_status == "success"), status_code=http_status)
-
-
-@app.get("/debug/agents")
-async def debug_agents(request: Request) -> JSONResponse:
-    """临时调试接口：返回 agent 队列与连接的当前内存状态。
-
-    注意：该接口仅用于调试，可能暴露内部信息；如果配置了 `AGENT_TOKEN`，仍需通过 `Authorization` 头访问。
-    """
-    _require_agent_auth(request)
-    async with AGENT_LOCK:
-        pending = list(AGENT_PENDING_TASKS)
-        running = {k: v for k, v in AGENT_RUNNING_TASKS.items()}
-        clients = {k: v for k, v in AGENT_CLIENTS.items()}
-        ws_connected = list(AGENT_WS_CONNECTIONS.keys())
-        ws_idle = list(AGENT_WS_IDLE)
-
-    data = {
-        "pending_count": len(pending),
-        "pending_tasks": [t.get("task_id") or None for t in pending],
-        "running_tasks": list(running.keys()),
-        "clients": clients,
-        "ws_connected_clients": ws_connected,
-        "ws_idle_clients": ws_idle,
-    }
-    return _api_response(data, "ok")
 
 
 if __name__ == "__main__":

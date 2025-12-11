@@ -71,7 +71,7 @@ class TaskUploader:
         self._browser = None
         self._context = None
 
-    def upload(self, task: Task, log: LogFn = None) -> dict[str, Path | None]:
+    def upload(self, task: Task, log: LogFn = None) -> dict[str, Path | str | None]:
         self._log(log, f"开始上传：{task.display_name()}")
         ensure_storage_state_file()
         self._load_state_meta()
@@ -186,10 +186,10 @@ class TaskUploader:
         self._log(log, "填写软件开发信息")
         self._fill_soft_dev_info_form(page, task, login_type, submit_role, log)
         self._log(log, "填写软件功能与特点")
-        sign_pdf_path = self._fill_soft_feature_form(page, task, login_type, submit_role, log)
+        sign_pdf_path, flow_number = self._fill_soft_feature_form(page, task, login_type, submit_role, log)
         self._log(log, "页面操作完成，关闭浏览器")
         page.close()
-        return {"sign_page_pdf": sign_pdf_path}
+        return {"sign_page_pdf": sign_pdf_path, "flow_number": flow_number}
 
     def _get_login_context(self, task: Task) -> tuple[str, str, str, str]:
         username = (task.config.get("login_username") or "").strip()
@@ -471,7 +471,7 @@ class TaskUploader:
         login_type: str,
         submit_role: str,
         log: LogFn,
-    ) -> Path | None:
+    ) -> tuple[Path | None, str | None]:
         #开发硬件环境
         self._log(log, "填写软件功能与特点")
         dev_hardware = task.meta.get("dev_hardware", "")
@@ -568,7 +568,7 @@ class TaskUploader:
         next_button = page.get_by_role("button", name="下一步")
         next_button.wait_for(state="visible", timeout=8000)
         next_button.click()
-        page.wait_for_timeout(5000)  # 或者等待具体元素
+        page.wait_for_timeout(8000)  # 或者等待具体元素
         self._ensure_certificate_receive_address_selected(page, log)
         if submit_role == "申请人":
             submit_button = page.get_by_role("button", name="保存并提交申请")
@@ -584,14 +584,15 @@ class TaskUploader:
 
         # 只有申请人模式才需要打印签章页，代理人保存草稿可以直接结束
         sign_pdf_path: Path | None = None
+        flow_number: str | None = None
         if submit_role == "申请人":
             try:
-                sign_pdf_path = self._generate_sign_page_pdf(page, task, log)
+                sign_pdf_path, flow_number = self._generate_sign_page_pdf(page, task, log)
             except Exception as e:
                 self._log(log, f"生成签章页 PDF 失败：{e}")
-        return sign_pdf_path
+        return sign_pdf_path, flow_number
 
-    def _generate_sign_page_pdf(self, page: Page, task: Task, log: LogFn) -> Path:
+    def _generate_sign_page_pdf(self, page: Page, task: Task, log: LogFn) -> tuple[Path, str | None]:
         """
         从当前任务详情页：
         1）点击【打印签章页】打开材料列表页（新窗口）；
@@ -669,7 +670,18 @@ class TaskUploader:
         except Exception:
             pass
 
-        return pdf_path
+        # 解析 URL 中的流水号（flowNumber）
+        flow_number: str | None = None
+        try:
+            from urllib.parse import urlparse, parse_qs
+
+            parsed = urlparse(sign_list_page.url)
+            qs = parse_qs(parsed.query)
+            flow_number = (qs.get("flowNumber") or [None])[0]
+        except Exception as e:
+            self._log(log, f"解析流水号失败：{e}")
+
+        return pdf_path, flow_number
 
     def _resolve_short_name(self, task: Task) -> str:
         # meta_value = task.meta.get("软件简称") or task.meta.get("软件全称")
